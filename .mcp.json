@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "n8n-mcp": {
+      "type": "stdio",
+      "command": "cmd",
+      "args": ["/c", "npx", "-y", "n8n-mcp"],
+      "env": {
+        "MCP_MODE": "stdio",
+        "N8N_API_URL": "https://n8n.oknaprof59.ru",
+        "N8N_API_KEY": "n8n_api_16ad4a7cec7f8da53f9070b2a2ee854c811a19f658866d1f1bc5df1bc3c7e209922f0f4c693ada8f"
+      }
+    }
+  }
+}

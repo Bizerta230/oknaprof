@@ -1,0 +1,421 @@
+{
+  "name": "Avito Webhook Processor",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "avito-marketplace",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [250, 300]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const crypto = require('crypto');\n\nconst webhookData = $input.all()[0].json;\nconst body = webhookData.body || webhookData;\n\nconst webhook_id = crypto.randomUUID();\n\nreturn [{\n  json: {\n    event_type: body.event_type,\n    timestamp: body.timestamp,\n    raw_data: body.data,\n    webhook_id: webhook_id,\n    received_at: new Date().toISOString(),\n    validated: true\n  }\n}];"
+      },
+      "id": "security-validation",
+      "name": "Security Validation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [450, 300]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const webhookData = $input.all()[0].json;\nconst eventType = webhookData.event_type;\nconst rawData = webhookData.raw_data;\n\nlet transformedData = {\n  webhook_id: webhookData.webhook_id,\n  event_type: eventType,\n  received_at: webhookData.received_at,\n  avito_timestamp: webhookData.timestamp,\n};\n\nswitch(eventType) {\n  case 'new_order':\n  case 'order_status_change':\n    transformedData = {\n      ...transformedData,\n      entity_type: 'order',\n      order: {\n        id: rawData.order_id,\n        external_id: rawData.order_id,\n        status: rawData.status,\n        total_amount: parseFloat(rawData.total_amount) || 0,\n        currency: 'RUB',\n        items: (rawData.items || []).map(item => ({\n          listing_id: item.listing_id,\n          title: item.title,\n          quantity: item.quantity || 1,\n          price: parseFloat(item.price) || 0\n        })),\n        customer: {\n          name: rawData.customer?.name || 'Unknown',\n          phone: rawData.customer?.phone || '',\n          email: rawData.customer?.email || '',\n          avito_user_id: rawData.user_id\n        },\n        created_at: rawData.created_at || webhookData.timestamp,\n        updated_at: new Date().toISOString()\n      }\n    };\n    break;\n\n  default:\n    transformedData.entity_type = 'unknown';\n    transformedData.raw_payload = rawData;\n}\n\nreturn [{ json: transformedData }];"
+      },
+      "id": "data-transformation",
+      "name": "Initial Data Transformation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [650, 300]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const crypto = require('crypto');\nconst data = $input.all()[0].json;\nconst order = data.order;\n\nif (!order) {\n  return [{\n    json: {\n      ...data,\n      validation: {\n        is_valid: false,\n        errors: ['No order data found'],\n        warnings: [],\n        validated_at: new Date().toISOString()\n      }\n    }\n  }];\n}\n\nconst validationErrors = [];\nconst validationWarnings = [];\n\nif (!order.id) validationErrors.push('Missing order ID');\nif (!order.total_amount || order.total_amount <= 0) {\n  validationErrors.push('Invalid order total amount');\n}\nif (!order.customer?.phone && !order.customer?.email) {\n  validationErrors.push('Missing customer contact information');\n}\nif (!order.items || order.items.length === 0) {\n  validationErrors.push('Order has no items');\n}\n\nif (order.total_amount > 100000) {\n  validationWarnings.push('High-value order - requires manual review');\n}\n\nconst orderHash = crypto\n  .createHash('md5')\n  .update(JSON.stringify({\n    order_id: order.id,\n    total: order.total_amount,\n    customer_phone: order.customer.phone\n  }))\n  .digest('hex');\n\nreturn [{\n  json: {\n    ...data,\n    validation: {\n      is_valid: validationErrors.length === 0,\n      errors: validationErrors,\n      warnings: validationWarnings,\n      validated_at: new Date().toISOString()\n    },\n    order_hash: orderHash,\n    processing_flags: {\n      needs_duplicate_check: true,\n      needs_enrichment: false,\n      high_priority: order.total_amount > 100000\n    }\n  }\n}];"
+      },
+      "id": "order-validation",
+      "name": "Order Validation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [850, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=SELECT id, status FROM avito_orders WHERE external_id = '{{ $json.order.external_id }}' OR order_hash = '{{ $json.order_hash }}' LIMIT 1",
+        "options": {}
+      },
+      "id": "check-duplicates",
+      "name": "Check for Duplicates",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [1050, 300],
+      "credentials": {
+        "postgres": {
+          "id": "CONFIGURE_THIS_IN_N8N",
+          "name": "Avito PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "condition1",
+              "leftValue": "={{ $('Check for Duplicates').all().length }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "is-duplicate",
+      "name": "Is Duplicate?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1250, 300]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "schema": {
+          "schema": "public"
+        },
+        "table": {
+          "table": "avito_orders"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "external_id": "={{ $json.order.external_id }}",
+            "order_hash": "={{ $json.order_hash }}",
+            "status": "={{ $json.order.status }}",
+            "total_amount": "={{ $json.order.total_amount }}",
+            "currency": "={{ $json.order.currency }}",
+            "customer_name": "={{ $json.order.customer.name }}",
+            "customer_phone": "={{ $json.order.customer.phone }}",
+            "customer_email": "={{ $json.order.customer.email }}",
+            "items_json": "={{ JSON.stringify($json.order.items) }}",
+            "webhook_data": "={{ JSON.stringify($json) }}",
+            "created_at": "={{ $json.order.created_at }}",
+            "updated_at": "={{ $json.order.updated_at }}"
+          },
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "id": "insert-order",
+      "name": "Insert New Order",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [1450, 400],
+      "credentials": {
+        "postgres": {
+          "id": "CONFIGURE_THIS_IN_N8N",
+          "name": "Avito PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "schema": {
+          "schema": "public"
+        },
+        "table": {
+          "table": "avito_orders"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "status": "={{ $json.order.status }}",
+            "updated_at": "={{ $json.order.updated_at }}",
+            "webhook_data": "={{ JSON.stringify($json) }}"
+          },
+          "matchingColumns": [
+            "external_id"
+          ],
+          "schema": []
+        },
+        "updateKey": "external_id",
+        "options": {}
+      },
+      "id": "update-order",
+      "name": "Update Existing Order",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [1450, 200],
+      "credentials": {
+        "postgres": {
+          "id": "CONFIGURE_THIS_IN_N8N",
+          "name": "Avito PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "options": {
+          "responseCode": 200,
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              }
+            ]
+          },
+          "responseBody": "={{ JSON.stringify({ status: 'received', webhook_id: $json.webhook_id, timestamp: $now.toISO(), message: 'Order processed successfully' }) }}"
+        }
+      },
+      "id": "quick-response",
+      "name": "Quick Webhook Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1650, 300]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "YOUR_TELEGRAM_CHAT_ID",
+        "text": "=🛒 *Новый заказ Avito*\\n\\n📦 Заказ: `{{ $json.order.external_id }}`\\n💰 Сумма: *{{ $json.order.total_amount }} ₽*\\n👤 Клиент: {{ $json.order.customer.name }}\\n📱 Телефон: {{ $json.order.customer.phone }}\\n\\n⏰ {{ $now.toFormat('dd.MM.yyyy HH:mm') }}",
+        "additionalFields": {
+          "parse_mode": "Markdown"
+        }
+      },
+      "id": "telegram-notification",
+      "name": "Telegram Notification",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1,
+      "position": [1850, 300],
+      "credentials": {
+        "telegramApi": {
+          "id": "CONFIGURE_THIS_IN_N8N",
+          "name": "Avito Notifications Bot"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "id": "error-trigger",
+      "name": "Error Handler",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [250, 500]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "schema": {
+          "schema": "public"
+        },
+        "table": {
+          "table": "webhook_errors"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "webhook_id": "={{ $json.webhook_id || 'unknown' }}",
+            "error_message": "={{ $json.error?.message || 'Unknown error' }}",
+            "error_stack": "={{ $json.error?.stack || '' }}",
+            "webhook_payload": "={{ JSON.stringify($json) }}"
+          },
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "id": "log-error",
+      "name": "Log Error to Database",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [450, 500],
+      "credentials": {
+        "postgres": {
+          "id": "CONFIGURE_THIS_IN_N8N",
+          "name": "Avito PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "YOUR_TELEGRAM_CHAT_ID",
+        "text": "=🚨 *Ошибка обработки webhook Avito*\\n\\n❌ Ошибка: {{ $json.error?.message || 'Unknown error' }}\\n🆔 Webhook ID: {{ $json.webhook_id || 'unknown' }}\\n⏰ {{ $now.toFormat('dd.MM.yyyy HH:mm') }}",
+        "additionalFields": {
+          "parse_mode": "Markdown"
+        }
+      },
+      "id": "error-alert",
+      "name": "Error Alert",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1,
+      "position": [650, 500],
+      "credentials": {
+        "telegramApi": {
+          "id": "CONFIGURE_THIS_IN_N8N",
+          "name": "Avito Notifications Bot"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Webhook Trigger": {
+      "main": [
+        [
+          {
+            "node": "Security Validation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Security Validation": {
+      "main": [
+        [
+          {
+            "node": "Initial Data Transformation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Initial Data Transformation": {
+      "main": [
+        [
+          {
+            "node": "Order Validation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Order Validation": {
+      "main": [
+        [
+          {
+            "node": "Check for Duplicates",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check for Duplicates": {
+      "main": [
+        [
+          {
+            "node": "Is Duplicate?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Duplicate?": {
+      "main": [
+        [
+          {
+            "node": "Update Existing Order",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Insert New Order",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Existing Order": {
+      "main": [
+        [
+          {
+            "node": "Quick Webhook Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert New Order": {
+      "main": [
+        [
+          {
+            "node": "Quick Webhook Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Quick Webhook Response": {
+      "main": [
+        [
+          {
+            "node": "Telegram Notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Error Handler": {
+      "main": [
+        [
+          {
+            "node": "Log Error to Database",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Error to Database": {
+      "main": [
+        [
+          {
+            "node": "Error Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "tags": [],
+  "triggerCount": 1,
+  "updatedAt": "2026-02-07T00:00:00.000Z",
+  "versionId": "1"
+}
